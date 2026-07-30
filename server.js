@@ -63,7 +63,12 @@ if (process.env.SMTP_HOST) {
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: String(process.env.SMTP_SECURE || 'false') === 'true', // true bei Port 465
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    // Feste Timeouts: Falls der Mailserver hängt, bricht der Versand ab,
+    // statt die ganze Anfrage (und damit Lexoffice) zu blockieren.
+    connectionTimeout: 12000,
+    greetingTimeout: 12000,
+    socketTimeout: 20000
   });
 }
 
@@ -255,12 +260,12 @@ app.post('/api/anfrage', upload.array('dateien', 10), async (req, res) => {
     const kundenName = firma || name;
     const daten = { leistungen, name, firma, email, telefon, groesse, ort, termin, nachricht, dateien: dateiNamen };
 
-    let emailOk = false;
-    let lexOk = false;
-    let angebotId = null;
+    // E-Mail und Lexoffice laufen UNABHÄNGIG und PARALLEL.
+    // Jeder Teil fängt seine Fehler selbst ab – fällt einer aus,
+    // läuft der andere trotzdem durch (nichts blockiert das andere).
 
-    // 1) E-Mail-Benachrichtigung (primär, zuverlässig)
-    if (mailer) {
+    async function versendeEmail() {
+      if (!mailer) { console.warn('Kein SMTP konfiguriert – E-Mail übersprungen.'); return false; }
       try {
         const { html, text } = baueEmail(daten, adresse);
         await mailer.sendMail({
@@ -271,28 +276,30 @@ app.post('/api/anfrage', upload.array('dateien', 10), async (req, res) => {
           html, text,
           attachments: files.map(f => ({ filename: f.originalname, content: f.buffer }))
         });
-        emailOk = true;
+        return true;
       } catch (e) {
         console.error('E-Mail-Fehler:', e.message);
+        return false;
       }
-    } else {
-      console.warn('Kein SMTP konfiguriert – E-Mail übersprungen.');
     }
 
-    // 2) Lexoffice (zusätzlich, best effort)
-    if (LEXOFFICE_API_KEY) {
+    async function legeInLexofficeAn() {
+      if (!LEXOFFICE_API_KEY) { console.warn('Kein LEXOFFICE_API_KEY – Lexoffice übersprungen.'); return { ok: false, id: null }; }
       try {
         const { contactId, hatAdresse } = await legeKontaktAn({ kundenName, email, telefon, adresse });
         const lineItems = baueLineItems(daten);
         const angebot = await legeAngebotAn({ contactId, kundenName, hatAdresse, lineItems });
-        angebotId = angebot.id;
-        lexOk = true;
+        return { ok: true, id: angebot.id };
       } catch (e) {
         console.error('Lexoffice-Fehler:', e.status || '', e.details || e.message);
+        return { ok: false, id: null };
       }
-    } else {
-      console.warn('Kein LEXOFFICE_API_KEY konfiguriert – Lexoffice übersprungen.');
     }
+
+    // Promise.all wirft hier nie, weil beide Funktionen ihre Fehler selbst abfangen.
+    const [emailOk, lex] = await Promise.all([versendeEmail(), legeInLexofficeAn()]);
+    const lexOk = lex.ok;
+    const angebotId = lex.id;
 
     if (!emailOk && !lexOk) {
       return res.status(502).json({ erfolg: false, fehler: 'Anfrage konnte weder per E-Mail noch in Lexoffice verarbeitet werden.' });
