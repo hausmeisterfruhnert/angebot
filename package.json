@@ -1,0 +1,18 @@
+{
+  "name": "fruhnert-angebot-server",
+  "version": "1.0.0",
+  "description": "Zwischen-Server für das Angebotsformular: verschickt Anfragen per E-Mail und legt Kontakt + Angebot in Lexoffice an.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.14"
+  }
+}
