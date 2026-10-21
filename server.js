@@ -43,10 +43,38 @@ app.use(cors({
 app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 10 }));
 
 // Datei-Uploads (Fotos & Co.) im Arbeitsspeicher entgegennehmen
+// Erlaubt: max. 3 Dateien, je max. 10 MB, nur Fotos (JPG, PNG, WEBP, HEIC) und PDF –
+// passend zum Formular („bis zu 3 Fotos oder PDFs, max. 10 MB pro Datei“).
+const MAX_DATEIEN = 3;
+const ERLAUBTE_DATEITYPEN = {
+  'image/jpeg': ['.jpg', '.jpeg'], 'image/png': ['.png'], 'image/webp': ['.webp'],
+  'image/heic': ['.heic'], 'image/heif': ['.heif', '.heic'], 'application/pdf': ['.pdf']
+};
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 10 } // 10 MB / max 10 Dateien
+  limits: { fileSize: 10 * 1024 * 1024, files: MAX_DATEIEN, fields: 30, fieldSize: 100 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const endung = (file.originalname.match(/\.[a-z0-9]+$/i) || [''])[0].toLowerCase();
+    const erlaubt = (ERLAUBTE_DATEITYPEN[file.mimetype] || []).includes(endung);
+    if (!erlaubt) {
+      req.abgelehnteDateien = (req.abgelehnteDateien || []).concat(file.originalname);
+      return cb(null, false); // Datei überspringen, Anfrage trotzdem annehmen
+    }
+    cb(null, true);
+  }
 });
+
+// Upload mit verständlicher Fehlermeldung statt Absturz/HTML-Fehlerseite
+function dateiUpload(req, res, next) {
+  upload.array('dateien', MAX_DATEIEN)(req, res, (err) => {
+    if (!err) return next();
+    const meldung = (err.code === 'LIMIT_FILE_SIZE') ? 'Eine Datei ist größer als 10 MB.'
+      : (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') ? 'Bitte höchstens ' + MAX_DATEIEN + ' Dateien anhängen.'
+      : 'Die Dateien konnten nicht verarbeitet werden.';
+    console.warn('Upload abgelehnt:', err.code || err.message);
+    return res.status(400).json({ erfolg: false, fehler: meldung });
+  });
+}
 
 /* ------------------------------------------------------------------ *
  * Konfiguration
@@ -381,7 +409,7 @@ function baueEmail(daten, adresse) {
 /* ------------------------------------------------------------------ *
  * Haupt-Endpunkt: Anfrage entgegennehmen
  * ------------------------------------------------------------------ */
-app.post('/api/anfrage', upload.array('dateien', 10), async (req, res) => {
+app.post('/api/anfrage', dateiUpload, async (req, res) => {
   try {
     const b = req.body || {};
     const name    = (b.name || '').trim();
@@ -404,6 +432,7 @@ app.post('/api/anfrage', upload.array('dateien', 10), async (req, res) => {
 
     const files = req.files || [];
     const dateiNamen = files.map(f => f.originalname);
+    if (req.abgelehnteDateien) console.warn('Dateien mit unzulässigem Typ übersprungen:', req.abgelehnteDateien.join(', '));
     const adresse = parseAdresse(b.strasse, b.plzOrt);
     const kundenName = firma || name;
     const daten = { leistungen, name, firma, email, telefon, groesse, ort, termin, nachricht, dateien: dateiNamen };
