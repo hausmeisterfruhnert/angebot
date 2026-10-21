@@ -75,26 +75,45 @@ if (process.env.SMTP_HOST) {
 /* ------------------------------------------------------------------ *
  * Hilfsfunktionen
  * ------------------------------------------------------------------ */
-async function lexofficeRequest(pfad, methode, body) {
-  const antwort = await fetch(LEXOFFICE_BASE_URL + pfad, {
-    method: methode,
-    headers: {
-      'Authorization': 'Bearer ' + LEXOFFICE_API_KEY,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
-  const text = await antwort.text();
-  let daten = null;
-  try { daten = text ? JSON.parse(text) : null; } catch (e) { daten = { rohtext: text }; }
-  if (!antwort.ok) {
-    const fehler = new Error('Lexoffice-API-Fehler: ' + antwort.status);
-    fehler.status = antwort.status;
-    fehler.details = daten;
-    throw fehler;
+/* Lexoffice erlaubt nur ca. 2 Anfragen pro Sekunde: alle Aufrufe nacheinander
+   mit 600 ms Abstand, bei 429 (Rate limit) automatisch erneut versuchen. */
+const LEX_ABSTAND_MS = 600;
+let lexWarteschlange = Promise.resolve();
+let lexLetzterAufruf = 0;
+const warte = (ms) => new Promise(r => setTimeout(r, ms));
+
+function lexofficeRequest(pfad, methode, body) {
+  const auftrag = lexWarteschlange.then(() => lexofficeAufruf(pfad, methode, body));
+  lexWarteschlange = auftrag.catch(() => {});
+  return auftrag;
+}
+
+async function lexofficeAufruf(pfad, methode, body) {
+  for (let versuch = 1; ; versuch++) {
+    const seitLetztem = Date.now() - lexLetzterAufruf;
+    if (seitLetztem < LEX_ABSTAND_MS) await warte(LEX_ABSTAND_MS - seitLetztem);
+    lexLetzterAufruf = Date.now();
+    const antwort = await fetch(LEXOFFICE_BASE_URL + pfad, {
+      method: methode,
+      headers: {
+        'Authorization': 'Bearer ' + LEXOFFICE_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    if (antwort.status === 429 && versuch < 6) { await warte(1000 * versuch); continue; }
+    const text = await antwort.text();
+    let daten = null;
+    try { daten = text ? JSON.parse(text) : null; } catch (e) { daten = { rohtext: text }; }
+    if (!antwort.ok) {
+      const fehler = new Error('Lexoffice-API-Fehler: ' + antwort.status);
+      fehler.status = antwort.status;
+      fehler.details = daten;
+      throw fehler;
+    }
+    return daten;
   }
-  return daten;
 }
 
 // "82194 Gröbenzell" / "Musterstr. 1" → strukturierte Adresse
@@ -107,31 +126,101 @@ function parseAdresse(strasse, plzOrt) {
   return { strasse, plz, ort, vollstaendig: Boolean(strasse && plz && ort) };
 }
 
-async function legeKontaktAn({ kundenName, email, telefon, adresse }) {
-  const payload = {
-    version: 0,
-    roles: { customer: {} },
-    company: { name: kundenName },
-    emailAddresses: { business: [email] }
-  };
-  // Hinweis: Kontakt-Payload bewusst identisch zum funktionierenden Kalkulator
-  // gehalten. Telefon steht in der E-Mail und im Angebotstext.
+/* ------------------------------------------------------------------ *
+ * Kunde in Lexoffice anlegen – so wie die Kunden dort gepflegt werden:
+ *   - mit Firma:  Firmenname + Ansprechpartner (Anrede/Vorname/Nachname, E-Mail, Telefon)
+ *   - ohne Firma: Privatperson mit Vorname + Nachname
+ *   Adresse = Rechnungsadresse (Straße 1 / PLZ 1 / Ort 1), Telefon = Telefon 1,
+ *   Formularangaben als Notiz. Gibt es den Kunden schon (gleiche E-Mail UND
+ *   gleicher Name), wird er wiederverwendet und um fehlende Daten ergänzt.
+ * ------------------------------------------------------------------ */
+const kurz = (v, max = 100) => String(v == null ? '' : v).replace(/[\r\n\t]+/g, ' ').trim().slice(0, max);
 
-  // 🔴 Lexoffice verlangt bei per contactId referenzierten Kontakten GENAU EINE
-  //    Rechnungsadresse. Nur setzen, wenn vollständig – sonst Fallback im Angebot.
-  if (adresse.vollstaendig) {
-    payload.addresses = {
-      billing: [{
-        street: adresse.strasse,
-        zip: adresse.plz,
-        city: adresse.ort,
-        countryCode: 'DE'
-      }]
-    };
+function teileName(name) {
+  let teile = kurz(name, 100).split(/\s+/).filter(Boolean);
+  let anrede;
+  if (teile.length > 1 && /^(herr|frau)$/i.test(teile[0])) {
+    anrede = teile[0][0].toUpperCase() + teile[0].slice(1).toLowerCase();
+    teile = teile.slice(1);
+  }
+  const nachname = teile.length > 1 ? teile.pop() : (teile[0] || '');
+  return { anrede, vorname: teile.length ? teile.join(' ') : '', nachname };
+}
+
+function telefonFeld(tel) {
+  const n = tel.replace(/[^0-9+]/g, '');
+  return /^(\+49|0049|0)1[5-7]/.test(n) ? 'mobile' : 'business';
+}
+
+async function findeKontakt(email, istFirma, firmenname, nachname) {
+  try {
+    const r = await lexofficeRequest('/contacts?customer=true&email=' + encodeURIComponent(email), 'GET');
+    const liste = r && Array.isArray(r.content) ? r.content : [];
+    const gleich = (x, y) => String(x || '').trim().toLowerCase() === String(y || '').trim().toLowerCase();
+    return liste.find(c => istFirma
+      ? (c.company && gleich(c.company.name, firmenname))
+      : (c.person && gleich(c.person.lastName, nachname))) || null;
+  } catch (e) {
+    console.warn('Kontaktsuche fehlgeschlagen, lege neuen Kontakt an:', e.status || e.message);
+    return null;
+  }
+}
+
+async function ergaenzeKontakt(id, { telefon, adr, notiz }) {
+  const k = await lexofficeRequest('/contacts/' + id, 'GET');
+  let geaendert = false;
+  k.addresses = k.addresses || {};
+  const billing = (k.addresses.billing || [])[0];
+  if (adr && !(billing && billing.street && billing.zip && billing.city)) { k.addresses.billing = [adr]; geaendert = true; }
+  if (telefon) {
+    k.phoneNumbers = k.phoneNumbers || {};
+    if (!Object.values(k.phoneNumbers).flat().includes(telefon)) {
+      const f = telefonFeld(telefon); k.phoneNumbers[f] = [...(k.phoneNumbers[f] || []), telefon]; geaendert = true;
+    }
+  }
+  if (notiz) { k.note = ((k.note ? k.note + '\n\n' : '') + notiz).slice(0, 1000); geaendert = true; }
+  if (!k.addresses.billing && !k.addresses.shipping) delete k.addresses;
+  if (geaendert) await lexofficeRequest('/contacts/' + id, 'PUT', k);
+  const b = (k.addresses && k.addresses.billing || [])[0];
+  return !!(b && b.zip && b.city);
+}
+
+async function legeKontaktAn({ name, firma, email, telefon, adresse, notiz }) {
+  const istFirma = !!firma;
+  const { anrede, vorname, nachname } = teileName(name);
+  const tel = kurz(telefon, 30);
+  const adr = adresse.vollstaendig
+    ? { street: kurz(adresse.strasse), zip: kurz(adresse.plz, 10), city: kurz(adresse.ort, 80), countryCode: 'DE' } : null;
+
+  const vorhanden = await findeKontakt(email, istFirma, kurz(firma), nachname);
+  if (vorhanden) {
+    let hatAdresse = false;
+    try { hatAdresse = await ergaenzeKontakt(vorhanden.id, { telefon: tel, adr, notiz }); }
+    catch (e) { console.warn('Kunde konnte nicht ergänzt werden:', e.status || e.message, e.details ? JSON.stringify(e.details) : ''); }
+    console.log('Vorhandenen Kunden verwendet und ergänzt:', vorhanden.id);
+    return { contactId: vorhanden.id, hatAdresse };
   }
 
+  const payload = { version: 0, roles: { customer: {} }, emailAddresses: { business: [email] } };
+  if (istFirma) {
+    payload.company = { name: kurz(firma) };
+    if (nachname) {
+      payload.company.contactPersons = [{
+        salutation: anrede, firstName: vorname || undefined, lastName: nachname, primary: true,
+        emailAddress: email, phoneNumber: tel || undefined
+      }];
+    }
+  } else {
+    payload.person = { salutation: anrede, firstName: vorname || undefined, lastName: nachname || kurz(name) };
+  }
+  if (tel) payload.phoneNumbers = { [telefonFeld(tel)]: [tel] };
+  // Lexoffice verlangt bei per contactId referenzierten Kontakten genau EINE Rechnungsadresse.
+  if (adr) payload.addresses = { billing: [adr] };
+  if (notiz) payload.note = notiz.slice(0, 1000);
+
   const ergebnis = await lexofficeRequest('/contacts', 'POST', payload);
-  return { contactId: ergebnis.id, hatAdresse: adresse.vollstaendig };
+  console.log('Neuer Kunde angelegt:', ergebnis.id, istFirma ? '(Firma mit Ansprechpartner)' : '(Privatperson)', tel ? 'mit Telefon' : 'ohne Telefon', adr ? 'mit Adresse' : 'OHNE Adresse');
+  return { contactId: ergebnis.id, hatAdresse: !!adr };
 }
 
 async function legeAngebotAn({ contactId, kundenName, hatAdresse, lineItems }) {
@@ -286,7 +375,11 @@ app.post('/api/anfrage', upload.array('dateien', 10), async (req, res) => {
     async function legeInLexofficeAn() {
       if (!LEXOFFICE_API_KEY) { console.warn('Kein LEXOFFICE_API_KEY – Lexoffice übersprungen.'); return { ok: false, id: null }; }
       try {
-        const { contactId, hatAdresse } = await legeKontaktAn({ kundenName, email, telefon, adresse });
+        const notiz = ['Anfrage über Website-Formular vom ' + new Date().toLocaleDateString('de-DE'),
+          leistungen.length ? 'Leistungen: ' + leistungen.join(', ') : '',
+          groesse ? 'Größen / Umfang: ' + groesse : '', ort ? 'Ort: ' + ort : '',
+          termin ? 'Wunschtermin: ' + termin : '', nachricht ? 'Nachricht: ' + nachricht : ''].filter(Boolean).join('\n');
+        const { contactId, hatAdresse } = await legeKontaktAn({ name, firma, email, telefon, adresse, notiz });
         const lineItems = baueLineItems(daten);
         const angebot = await legeAngebotAn({ contactId, kundenName, hatAdresse, lineItems });
         return { ok: true, id: angebot.id };
