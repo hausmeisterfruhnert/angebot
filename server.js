@@ -248,13 +248,75 @@ async function legeAngebotAn({ contactId, kundenName, hatAdresse, lineItems }) {
   return await lexofficeRequest('/quotations', 'POST', payload);
 }
 
-function baueLineItems({ leistungen, name, telefon, email, groesse, ort, termin, nachricht, dateien }) {
+/* ------------------------------------------------------------------ *
+ * Leistungen als Lexoffice-ARTIKEL (Dienstleistung) mit Preis 0 €.
+ * Gleiche Artikelnummern wie beim Kalkulator (KALK-...), damit überall
+ * dieselben Artikel genutzt werden. Fehlt ein Artikel, wird er angelegt.
+ * Optional feste IDs per Umgebungsvariable, z. B. ARTIKEL_WINTER=<ID>.
+ * ------------------------------------------------------------------ */
+const ARTIKEL = [
+  { key: 'hausverwaltung', nr: 'KALK-HAUSVERWALTUNG', titel: 'Hausverwaltung – Betreuung mehrerer Objekte', einheit: 'Monat', test: /hausverwaltung/i },
+  { key: 'hausmeister',    nr: 'KALK-HAUSMEISTER',    titel: 'Hausmeisterservice',                          einheit: 'Monat', test: /hausmeister/i },
+  { key: 'dachrinne',      nr: 'KALK-DACHRINNE',      titel: 'Dachrinnenreinigung (Dachrinnensauger mit Kamera)', einheit: 'Stück', test: /dachrinne/i },
+  { key: 'tiefgarage',     nr: 'KALK-TIEFGARAGE',     titel: 'Tiefgaragenreinigung (Nassreinigung)',        einheit: 'Stück', test: /tiefgarage/i },
+  { key: 'winter',         nr: 'KALK-WINTER',         titel: 'Winterdienst',                                einheit: 'Monat', test: /winter/i },
+  { key: 'spuelwagen',     nr: 'KALK-SPUELWAGEN',     titel: 'Spülwagenvermietung',                         einheit: 'Stück', test: /sp(ü|ue)lwagen/i },
+  { key: 'unterhalt',      nr: 'KALK-UNTERHALT',      titel: 'Unterhaltsreinigung (Büro & Kita)',           einheit: 'Monat', test: /unterhalt/i },
+  { key: 'teppich',        nr: 'KALK-TEPPICH',        titel: 'Teppichreinigung (Treppenhaus, Büro, Wohnung)', einheit: 'Stück', test: /teppich/i },
+  { key: 'leerstand',      nr: 'KALK-LEERSTAND',      titel: 'Leerstands- und Urlaubsbetreuung',            einheit: 'Monat', test: /leerstand|urlaub/i }
+];
+const artikelCache = {};
+let artikelGeladen = false;
+
+async function ladeArtikelListe() {
+  if (artikelGeladen) return;
+  for (let seite = 0; seite < 10; seite++) {
+    const r = await lexofficeRequest('/articles?type=SERVICE&size=250&page=' + seite, 'GET');
+    const liste = (r && Array.isArray(r.content)) ? r.content : [];
+    for (const art of liste) {
+      const a = ARTIKEL.find(x => x.nr === art.articleNumber);
+      if (a) artikelCache[a.key] = art.id;
+    }
+    if (!r || r.last !== false || liste.length === 0) break;
+  }
+  artikelGeladen = true;
+}
+
+async function artikelFuer(a) {
+  const envId = process.env['ARTIKEL_' + a.key.toUpperCase()];
+  if (envId) return envId;
+  try {
+    await ladeArtikelListe();
+    if (artikelCache[a.key]) return artikelCache[a.key];
+    const neu = await lexofficeRequest('/articles', 'POST', {
+      title: a.titel, type: 'SERVICE', articleNumber: a.nr, unitName: a.einheit,
+      price: { netPrice: 0, leadingPrice: 'NET', taxRate: 19 }
+    });
+    if (neu && neu.id) artikelCache[a.key] = neu.id;
+    return artikelCache[a.key] || null;
+  } catch (e) {
+    console.warn('Artikel ' + a.nr + ' nicht verfügbar, nutze Position ohne Artikel:', e.status || e.message, e.details ? JSON.stringify(e.details) : '');
+    return null;
+  }
+}
+
+async function baueLineItems({ leistungen, name, telefon, email, groesse, ort, termin, nachricht, dateien }) {
   const items = [];
 
-  if (leistungen.length) {
-    items.push({ type: 'text', name: 'Angefragte Leistungen', description: leistungen.join(', ') });
+  // 1) Jede angefragte Leistung als Artikel mit Preis 0 € (wird nach Besichtigung bepreist)
+  for (const leistung of leistungen) {
+    const text = String(leistung && (leistung.name || leistung.id || leistung) || '').trim();
+    if (!text) continue;
+    const a = ARTIKEL.find(x => x.test.test(text));
+    const basis = {
+      name: (a ? a.titel : text).slice(0, 250), quantity: 1, unitName: a ? a.einheit : 'Stück',
+      unitPrice: { currency: 'EUR', netAmount: 0, taxRatePercentage: 19 }
+    };
+    const id = a ? await artikelFuer(a) : null;
+    items.push(id ? Object.assign({ id, type: 'service' }, basis) : Object.assign({ type: 'custom' }, basis));
   }
 
+  // 2) Angaben aus dem Formular weiterhin als Info-Text
   const zeilen = [];
   zeilen.push('Ansprechpartner: ' + name);
   if (telefon)  zeilen.push('Telefon: ' + telefon);
@@ -266,10 +328,6 @@ function baueLineItems({ leistungen, name, telefon, email, groesse, ort, termin,
   if (dateien && dateien.length) zeilen.push('Angehängte Dateien: ' + dateien.join(', '));
   items.push({ type: 'text', name: 'Angaben aus dem Formular', description: zeilen.join('\n') });
 
-  // Sicherheitsnetz: lineItems dürfen nie komplett leer sein
-  if (items.length === 0) {
-    items.push({ type: 'text', name: 'Anfrage', description: 'Angebotsanfrage über das Website-Formular.' });
-  }
   return items;
 }
 
@@ -338,6 +396,7 @@ app.post('/api/anfrage', upload.array('dateien', 10), async (req, res) => {
     let leistungen = [];
     try { leistungen = JSON.parse(b.leistungenJson || '[]'); } catch (e) { leistungen = []; }
     if (!Array.isArray(leistungen)) leistungen = [];
+    leistungen = leistungen.map(l => (l && typeof l === 'object') ? String(l.name || l.id || '') : String(l)).filter(Boolean);
 
     if (!name || !email) {
       return res.status(400).json({ erfolg: false, fehler: 'Name und E-Mail sind erforderlich.' });
@@ -380,7 +439,7 @@ app.post('/api/anfrage', upload.array('dateien', 10), async (req, res) => {
           groesse ? 'Größen / Umfang: ' + groesse : '', ort ? 'Ort: ' + ort : '',
           termin ? 'Wunschtermin: ' + termin : '', nachricht ? 'Nachricht: ' + nachricht : ''].filter(Boolean).join('\n');
         const { contactId, hatAdresse } = await legeKontaktAn({ name, firma, email, telefon, adresse, notiz });
-        const lineItems = baueLineItems(daten);
+        const lineItems = await baueLineItems(daten);
         const angebot = await legeAngebotAn({ contactId, kundenName, hatAdresse, lineItems });
         return { ok: true, id: angebot.id };
       } catch (e) {
